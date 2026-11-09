@@ -1,0 +1,86 @@
+name: iOS unsigned IPA
+
+# 只做一件事：在 macOS runner 上编译出「未签名」的 arm64 IPA，
+# 供 SideStore / AltStore / Sideloadly 用你自己的 Apple ID 重签后装到 iPhone。
+# 上游官方 Release 不提供 IPA（iOS 包必须开发者证书签名），所以这里走未签名路线。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源码 ref（留空 = 当前分支）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned arm64 IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          command -v xcodegen >/dev/null && xcodegen --version || echo "xcodegen: 未安装"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: ios-unsigned
+
+      - name: 安装 xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 iOS Xcode 工程
+        run: pnpm tauri ios init --ci
+
+      - name: 构建未签名 IPA
+        run: bash scripts/ios-unsigned-ipa.sh
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          ls -lh HGhub-unsigned.ipa
+          unzip -l HGhub-unsigned.ipa | head -20
+          unzip -l HGhub-unsigned.ipa | grep -q 'Payload/[^/]*\.app/[^/]*' || {
+            echo "::error::IPA 结构不对，缺少 Payload/*.app/*"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-unsigned-ipa
+          path: HGhub-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
