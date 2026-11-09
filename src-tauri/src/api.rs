@@ -357,9 +357,54 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
+    // 上游已把播放地址迁到 POST /api/videos/{id}/episodes/{ep}/playback：
+    // 返回 { streams: { main, hevc, preview }, cdn: {...}, media_id, ep, duration ... }。
+    // 旧的 GET /api/videos/{id}/play 仍回 200，但 video_url / media_id 恒为空字符串，
+    // 前端据此提示「暂无播放地址」——这是 1.2.0 起所有剧集都放不出来的原因。
+    let origin = base();
+    let token = state.session.token(&origin);
+    let fresh = edge(
+        &origin,
+        "POST",
+        &format!("/api/videos/{id}/episodes/{ep}/playback"),
+        Some(json!({})),
+        token.as_deref(),
+    )
+    .await;
+
+    if let Ok(data) = &fresh {
+        let main = data
+            .get("streams")
+            .and_then(|s| s.get("main"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !main.is_empty() {
+            let mut out = data.clone();
+            if let Some(obj) = out.as_object_mut() {
+                // 前端只认 video_url；保留 streams/cdn 等新字段供排查。
+                obj.insert("video_url".to_string(), json!(main));
+            }
+            return Ok(out);
+        }
+    }
+
+    // 旧接口兜底：上游若回滚仍能用。
+    let legacy = state
         .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+        .await?;
+    let has_legacy = legacy
+        .get("video_url")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if has_legacy {
+        return Ok(legacy);
+    }
+
+    // 两个接口都没给地址：优先抛新接口的错误，比空对象更接近真实原因。
+    match fresh {
+        Err(e) => Err(e),
+        Ok(_) => Ok(legacy),
+    }
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
